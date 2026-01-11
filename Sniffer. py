@@ -1,0 +1,99 @@
+from scapy.all import sniff, IP, TCP, UDP
+import sqlite3
+from datetime import datetime
+from collections import defaultdict
+import time
+
+# 1) SQLite setup
+conn = sqlite3.connect("traffic.db")
+cur = conn.cursor()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS packets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT,
+    src_ip TEXT,
+    dst_ip TEXT,
+    src_port INTEGER,
+    dst_port INTEGER,
+    proto TEXT,
+    length INTEGER,
+    flags TEXT
+)
+""")
+conn.commit()
+
+# 2) Anomaly detection settings
+WINDOW_SECONDS = 10          # time window for counting packets
+PORT_SCAN_THRESHOLD = 20     # unique destination ports from one IP
+FLOOD_THRESHOLD = 100        # packets from one IP in window
+
+packet_times = defaultdict(list)   # src_ip -> [timestamps]
+ports_per_ip = defaultdict(set)    # src_ip -> {dst_ports}
+
+
+def handle_packet(pkt):
+    if IP not in pkt:
+        return
+
+    ip = pkt[IP]
+    proto = "OTHER"
+    sport = dport = None
+    flags = ""
+
+    if TCP in pkt:
+        tcp = pkt[TCP]
+        proto = "TCP"
+        sport = tcp.sport
+        dport = tcp.dport
+        flags = tcp.flags
+    elif UDP in pkt:
+        udp = pkt[UDP]
+        proto = "UDP"
+        sport = udp.sport
+        dport = udp.dport
+
+    ts = datetime.now().isoformat(timespec="seconds")
+    length = len(pkt)
+
+    # 3) Store in SQLite
+    cur.execute(
+        "INSERT INTO packets (ts, src_ip, dst_ip, src_port, dst_port, proto, length, flags) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (ts, ip.src, ip.dst, sport, dport, proto, length, str(flags))
+    )
+    conn.commit()
+
+    # 4) Print live summary
+    print(f"[{ts}] {ip.src}:{sport} -> {ip.dst}:{dport} {proto} len={length} flags={flags}")
+
+    # 5) Basic anomaly detection
+    now = time.time()
+    src = ip.src
+
+    # Record this packet time
+    packet_times[src].append(now)
+    # Track destination ports
+    if dport is not None:
+        ports_per_ip[src].add(dport)
+
+    # Remove old timestamps outside window
+    packet_times[src] = [t for t in packet_times[src] if now - t <= WINDOW_SECONDS]
+
+    # Flood alert
+    if len(packet_times[src]) > FLOOD_THRESHOLD:
+        print(f"[ALERT] Possible flood from {src} "
+              f"({len(packet_times[src])} packets in {WINDOW_SECONDS}s)")
+
+    # Port scan alert (TCP only)
+    if proto == "TCP" and dport is not None:
+        ports_per_ip[src].add(dport)
+
+    if len(ports_per_ip[src]) >= 3:  # lower threshold
+        print(f"[ALERT] Possible port scan from {src} "
+              f"to {len(ports_per_ip[src])} different destination ports")
+
+
+if __name__ == "__main__":
+    print("[*] Starting sniffing (Ctrl+C to stop)...")
+    # You can add iface="Ethernet" or similar if needed
+    sniff(prn=handle_packet, store=False)
